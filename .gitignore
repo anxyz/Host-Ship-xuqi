@@ -1,0 +1,8 @@
+.venv/
+.ruff_cache/
+__pycache__/
+*.pyc
+hostship_*.png
+sing-box
+sing-box*.json
+sing-box*.log

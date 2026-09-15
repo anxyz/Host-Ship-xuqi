@@ -2,13 +2,22 @@ name: Host-Ship Auto Renew
 
 on:
   workflow_dispatch:
+    inputs:
+      notify:
+        description: 发送 Telegram 图文通知
+        type: boolean
+        default: true
 
   schedule:
-    # UTC 21:20
+    # UTC 每月 1、4、7……日 21:20，即次日北京时间 05:20
     - cron: "20 21 */3 * *"
 
 permissions:
   contents: read
+
+concurrency:
+  group: host-ship-renewal
+  cancel-in-progress: false
 
 jobs:
   renew:
@@ -23,26 +32,49 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install playwright requests "requests[socks]"
+          pip install -r requirements-dev.txt
           python -m playwright install --with-deps chromium
+
+      - name: Run regression tests
+        run: |
+          ruff check .
+          ruff format --check .
+          python -m unittest discover -s tests -v
 
       - name: Setup optional VLESS/VMess/Trojan node
         env:
           NODE_LINK: ${{ secrets.NODE_LINK }}
         run: |
-          if [ -n "$NODE_LINK" ]; then
-            echo "NODE_LINK detected, setting up local proxy..."
-
-            bash <(wget -qO- https://main.ssss.nyc.mn/setup_proxy.sh)
-
-          else
+          if [ -z "$NODE_LINK" ]; then
             echo "IS_PROXY=false" >> "$GITHUB_ENV"
-            echo "No NODE_LINK, direct connection will be used."
+            echo "未配置节点，将使用直连"
+            exit 0
           fi
+          if ! curl --fail --silent --location --retry 3 \
+            https://main.ssss.nyc.mn/setup_proxy.sh \
+            -o "$RUNNER_TEMP/hostship_setup_proxy.sh" >/dev/null 2>&1; then
+            echo "::error::代理安装脚本下载失败"
+            exit 1
+          fi
+          for attempt in 1 2 3; do
+            if python scripts/private_run.py --proxy-setup bash "$RUNNER_TEMP/hostship_setup_proxy.sh"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "代理初始化失败，5 秒后重试"
+              sleep 5
+            fi
+          done
+          echo "::error::代理初始化失败"
+          exit 1
 
       - name: Run renew
         env:
@@ -54,23 +86,16 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
           MANUAL_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          SEND_TG: ${{ github.event_name != 'workflow_dispatch' || inputs.notify }}
+          SCHEDULE_LABEL: "约每3天，北京时间05:20"
 
           IS_PROXY: ${{ env.IS_PROXY }}
           PROXY_SERVER: ${{ env.PROXY_SERVER }}
 
-        run: python hostship_renew.py
-
-      - name: Upload screenshots on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hostship-debug-screenshots
-          path: |
-            hostship_*.png
-          if-no-files-found: ignore
+        run: python scripts/private_run.py python -u hostship_renew.py
 
       - name: Cleanup proxy
         if: always()
         run: |
-          pkill -f sing-box || true
+          pkill -x sing-box || true
           rm -f sing-box sing-box-config.json sing-box.log || true

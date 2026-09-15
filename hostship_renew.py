@@ -1,812 +1,525 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Check one Host-Ship server and notify once, without public account details."""
 
 import os
 import re
-import sys
 import time
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
+from ipaddress import ip_address
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
 from playwright.sync_api import sync_playwright
 
-
 SERVER_URL = os.getenv("SERVER_URL", "").strip()
 HOSTSHIP_LOGIN = os.getenv("HOSTSHIP_LOGIN", "").strip()
-HOSTSHIP_PASSWORD = os.getenv("HOSTSHIP_PASSWORD", "").strip()
-
+# A password's leading/trailing spaces may be intentional.
+HOSTSHIP_PASSWORD = os.getenv("HOSTSHIP_PASSWORD", "")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
-
 IS_PROXY = os.getenv("IS_PROXY", "false").lower() == "true"
-PROXY_SERVER = os.getenv(
-    "PROXY_SERVER",
-    "socks5://127.0.0.1:1080"
-).strip()
-
-MANUAL_RUN = os.getenv(
-    "MANUAL_RUN",
-    "false"
-).lower() == "true"
-
+PROXY_SERVER = os.getenv("PROXY_SERVER", "socks5://127.0.0.1:1080").strip()
+MANUAL_RUN = os.getenv("MANUAL_RUN", "false").lower() == "true"
+SEND_TG = os.getenv("SEND_TG", "true").lower() == "true"
+SCHEDULE_LABEL = os.getenv("SCHEDULE_LABEL", "以 Actions 定时配置为准")
 BJ_TZ = ZoneInfo("Asia/Shanghai")
 
+LOGIN_FIELDS = (
+    (
+        'input[name="email" i]',
+        'input[type="email"]',
+        'input[name="username" i]',
+        'input[autocomplete="username"]',
+    ),
+    (
+        'input[name="password" i]',
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+    ),
+)
+RENEW_NAME = re.compile(r"^Renew(?:\s+Now|\s+Server)?$", re.I)
+CONFIRM_NAME = re.compile(r"^Renew\s+now$", re.I)
+LIMIT_REACHED = re.compile(r"Renew\s+Limit\s+Reached", re.I)
+SUCCESS_NOTICE = re.compile(
+    r"^(?:(?:your|the)\s+)?(?:server\s+(?:has\s+been\s+)?)?"
+    r"(?:renewed successfully|renewal successful|successfully renewed)[.!]?$",
+    re.I,
+)
 
-def log(msg):
-    print(
-        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}",
-        flush=True
-    )
+
+@dataclass(frozen=True)
+class CheckResult:
+    kind: str
+    before: str = "未识别"
+    after: str = "未识别"
+    reason: str = ""
+
+    @property
+    def exit_code(self):
+        return 0 if self.kind in ("renewed", "not_due") else 1
+
+
+def log(message):
+    # Only static states go here. The workflow additionally filters child output.
+    print(message, flush=True)
+
+
+def valid_server_url(url):
+    try:
+        parsed = urlsplit(url)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "panel.host-ship.com"
+            and parsed.port in (None, 443)
+            and parsed.username is None
+            and parsed.password is None
+            and re.fullmatch(r"/server/[A-Za-z0-9_-]+/?", parsed.path) is not None
+        )
+    except ValueError:
+        return False
+
+
+def is_server_url(url):
+    try:
+        actual, expected = urlsplit(url), urlsplit(SERVER_URL)
+        return (
+            valid_server_url(url)
+            and actual.hostname == expected.hostname
+            and actual.path.rstrip("/") == expected.path.rstrip("/")
+        )
+    except ValueError:
+        return False
 
 
 def server_id():
-    if not SERVER_URL:
-        return "未知"
+    return (
+        urlsplit(SERVER_URL).path.rstrip("/").rsplit("/", 1)[-1]
+        if valid_server_url(SERVER_URL)
+        else "未知"
+    )
 
-    return SERVER_URL.rstrip("/").split("/")[-1]
 
-
-def node_status():
-    if IS_PROXY:
-        return "✅ 已启用"
-
-    return "⚪ 未启用（直连）"
+def redact(text):
+    text = str(text)
+    for value in (
+        HOSTSHIP_LOGIN,
+        HOSTSHIP_PASSWORD,
+        TG_BOT_TOKEN,
+        TG_CHAT_ID,
+        SERVER_URL,
+        os.getenv("NODE_LINK", ""),
+    ):
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    return re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "[EMAIL]", text)
 
 
 def get_days(text):
-    if not text:
-        return None
-
-    match = re.search(
-        r"(\d+)\s*Days?",
-        text,
-        re.I
-    )
-
-    if match:
-        return int(match.group(1))
-
-    return None
+    match = re.search(r"(?<![\d.])(\d+)\s*Days?\b", text or "", re.I)
+    return int(match.group(1)) if match else None
 
 
-def beijing_now():
-    return datetime.now(BJ_TZ)
+def renewal_text(body):
+    for pattern in (
+        r"Renewal\s+in\s+\d+\s+Days?",
+        r"Renew\s+in\s+\d+\s+Days?",
+        r"\d+\s+Days?\s+until\s+renewal",
+    ):
+        match = re.search(pattern, body, re.I)
+        if match:
+            return " ".join(match.group(0).split())
+    return "Renew Limit Reached" if LIMIT_REACHED.search(body) else "未识别"
 
 
-def estimate_renew_date(status):
-    days = get_days(status)
-
-    if days is None:
-        return None
-
-    return (
-        beijing_now().date()
-        + timedelta(days=days)
-    )
-
-
-def tg(text):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        log("⚠️ Telegram 未配置，跳过通知")
-        return False
-
-    try:
-        proxies = None
-
-        if IS_PROXY:
-            proxies = {
-                "http": PROXY_SERVER,
-                "https": PROXY_SERVER,
-            }
-
-        response = requests.post(
-            (
-                "https://api.telegram.org/"
-                f"bot{TG_BOT_TOKEN}/sendMessage"
-            ),
-            json={
-                "chat_id": TG_CHAT_ID,
-                "text": text,
-            },
-            timeout=20,
-            proxies=proxies,
-        )
-
-        if response.ok:
-            log("✅ Telegram 通知发送成功")
-            return True
-
-        log(
-            "❌ Telegram 通知失败: "
-            + response.text
-        )
-
-        return False
-
-    except Exception as exc:
-        log(
-            f"❌ Telegram 通知异常: {exc}"
-        )
-        return False
-
-
-def current_ip():
-    try:
-        proxies = None
-
-        if IS_PROXY:
-            proxies = {
-                "http": PROXY_SERVER,
-                "https": PROXY_SERVER,
-            }
-
-        response = requests.get(
-            "https://api.ipify.org",
-            timeout=15,
-            proxies=proxies,
-        )
-
-        if response.ok:
-            return response.text.strip()
-
-        return "获取失败"
-
-    except Exception:
-        return "获取失败"
-
-
-def build_check_message(status, ip):
-    days = get_days(status)
-    renew_date = estimate_renew_date(status)
-    now = beijing_now()
-
-    lines = [
-        "⏳ Host-Ship 检查完成",
-        "",
-        f"🖥️ 服务器：#{server_id()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-        "🔒 当前状态：未到续期时间",
-    ]
-
-    if days is not None:
-        lines.append(
-            f"⏱️ 距离续期：约 {days} 天"
-        )
-
-    if renew_date is not None:
-        lines.append(
-            "📆 预计可续期："
-            + renew_date.strftime("%Y/%m/%d")
-        )
-
-    if days is None:
-        lines.append(
-            f"📅 面板状态：{status}"
-        )
-
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
-    )
-
-    return "\n".join(lines)
-
-
-def build_success_message(before, after, ip):
-    before_days = get_days(before)
-    after_days = get_days(after)
-    now = beijing_now()
-
-    lines = [
-        "🎉 Host-Ship 续期成功",
-        "",
-        f"🖥️ 服务器：#{server_id()}",
-        f"🌐 节点状态：{node_status()}",
-        f"📍 出口IP：{ip}",
-        f"🕗 续期时间：{now.strftime('%Y/%m/%d %H:%M')}",
-        "",
-    ]
-
-    if before_days is not None:
-        lines.append(
-            f"📅 续期前：约 {before_days} 天"
-        )
-    else:
-        lines.append(
-            f"📅 续期前：{before}"
-        )
-
-    if after_days is not None:
-        lines.append(
-            f"✅ 续期后：约 {after_days} 天"
-        )
-    else:
-        lines.append(
-            f"✅ 续期后：{after}"
-        )
-
-    lines.append(
-        "⏰ 自动检查：每天 08:00（北京时间）"
-    )
-
-    return "\n".join(lines)
-
-
-def build_error_message(title, reason, ip):
-    now = beijing_now()
-
-    return (
-        f"{title}\n\n"
-        f"🖥️ 服务器：#{server_id()}\n"
-        f"🌐 节点状态：{node_status()}\n"
-        f"📍 出口IP：{ip}\n"
-        f"🕗 检查时间：{now.strftime('%Y/%m/%d %H:%M')}\n\n"
-        f"⚠️ 原因：{reason}"
-    )
+def get_renewal_text(page):
+    return renewal_text(page.locator("body").inner_text())
 
 
 def first_visible(page, selectors):
     for selector in selectors:
-        locator = page.locator(
-            selector
-        ).first
-
-        try:
-            if (
-                locator.count()
-                and locator.is_visible()
-            ):
-                return locator
-
-        except Exception:
-            pass
-
+        for item in page.locator(selector).all():
+            if item.is_visible():
+                return item
     return None
 
 
-def login_if_needed(page):
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
+def login_fields(page):
+    return tuple(first_visible(page, selectors) for selectors in LOGIN_FIELDS)
+
+
+def first_action(groups, enabled=True):
+    for group in groups:
+        for item in group.all():
+            if not item.is_visible():
+                continue
+            if enabled and (
+                not item.is_enabled()
+                or item.get_attribute("aria-disabled") == "true"
+                or "disabled" in (item.get_attribute("class") or "").split()
+            ):
+                continue
+            return item
+    return None
+
+
+def find_renew_button(page, enabled=True):
+    return first_action(
+        (page.get_by_role("button", name=RENEW_NAME), page.get_by_role("link", name=RENEW_NAME)),
+        enabled=enabled,
     )
 
-    time.sleep(2)
 
-    body = page.locator(
-        "body"
-    ).inner_text().lower()
+def server_page_ready(page):
+    if not is_server_url(page.url) or all(login_fields(page)):
+        return False
+    return get_renewal_text(page) != "未识别" or find_renew_button(page, enabled=False) is not None
 
-    if (
-        "/server/" in page.url
-        and "password" not in body
-    ):
-        return True
 
-    email = first_visible(
-        page,
-        [
-            'input[name="email"]',
-            'input[type="email"]',
-            'input[name="username"]',
-            'input[autocomplete="username"]',
-        ],
-    )
-
-    password = first_visible(
-        page,
-        [
-            'input[name="password"]',
-            'input[type="password"]',
-            'input[autocomplete="current-password"]',
-        ],
-    )
-
-    if not email or not password:
-        log(
-            "❌ 没找到登录框，"
-            f"当前页面: {page.url}"
+def security_challenge(page):
+    text = page.locator("body").inner_text().lower()
+    return (
+        any(
+            word in text
+            for word in (
+                "verify you are human",
+                "checking your browser",
+                "complete the security check",
+            )
         )
+        or first_visible(
+            page,
+            (
+                'iframe[src*="challenges.cloudflare.com"]',
+                ".g-recaptcha",
+                ".cf-turnstile",
+            ),
+        )
+        is not None
+    )
+
+
+def login_if_needed(page, timeout=20000):
+    page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+    deadline = time.monotonic() + timeout / 1000
+    while time.monotonic() < deadline:
+        if server_page_ready(page):
+            return True
+        if urlsplit(page.url).hostname != "panel.host-ship.com" or security_challenge(page):
+            log("⚠️ 登录页面需要人工检查")
+            return False
+        email, password = login_fields(page)
+        if email is not None and password is not None:
+            break
+        page.wait_for_timeout(250)
+    else:
         return False
 
-    if (
-        not HOSTSHIP_LOGIN
-        or not HOSTSHIP_PASSWORD
-    ):
-        log(
-            "❌ 缺少 HOSTSHIP_LOGIN "
-            "/ HOSTSHIP_PASSWORD"
-        )
+    if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
         return False
-
-    log("🔐 正在登录 Host-Ship...")
-
+    log("🔐 正在登录 Host-Ship")
     email.fill(HOSTSHIP_LOGIN)
     password.fill(HOSTSHIP_PASSWORD)
-
     submit = first_visible(
         page,
-        [
+        (
             'button[type="submit"]',
+            'input[type="submit"]',
             'button:has-text("Login")',
             'button:has-text("Sign in")',
             'button:has-text("Log in")',
-        ],
+        ),
     )
-
-    if not submit:
-        log("❌ 没找到登录按钮")
+    if submit is None:
         return False
-
+    login_path = urlsplit(page.url).path
     submit.click()
-
-    page.wait_for_timeout(3000)
-
-    text = page.locator(
-        "body"
-    ).inner_text().lower()
-
-    challenge_words = [
-        "captcha",
-        "verify you are human",
-        "security check",
-        "cloudflare",
-    ]
-
-    if any(
-        word in text
-        for word in challenge_words
-    ):
-        log(
-            "⚠️ 检测到验证码/"
-            "安全验证，需要手动处理"
-        )
-        return False
-
-    page.goto(
-        SERVER_URL,
-        wait_until="domcontentloaded",
-        timeout=60000,
-    )
-
-    page.wait_for_timeout(2000)
-
-    return "/server/" in page.url
-
-
-def get_renewal_text(page):
-    text = page.locator(
-        "body"
-    ).inner_text()
-
-    patterns = [
-        r"Renewal\s+in\s+\d+\s+Days?",
-        r"Renew\s+in\s+\d+\s+Days?",
-        r"\d+\s+Days?\s+until\s+renewal",
-    ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.I,
-        )
-
-        if match:
-            return match.group(0)
-
-    if re.search(
-        r"Renew\s+Limit\s+Reached",
-        text,
-        re.I,
-    ):
-        return "Renew Limit Reached"
-
-    return "未识别"
-
-
-def find_renew_button(page):
-    candidates = [
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "link",
-            name=re.compile(
-                r"^Renew(?:\s+Now|\s+Server)?$",
-                re.I,
-            ),
-        ),
-        page.locator(
-            'button:has-text("Renew")'
-        ),
-        page.locator(
-            'a:has-text("Renew")'
-        ),
-    ]
-
-    for group in candidates:
-        try:
-            count = group.count()
-
-            for i in range(count):
-                item = group.nth(i)
-
-                if item.is_visible():
-                    return item
-
-        except Exception:
-            pass
-
-    return None
-
-
-def confirm_renewal(page):
-    """Wait for the renewal dialog and click the real submit button."""
-    title = page.get_by_text(
-        re.compile(
-            r"Confirm\s+server\s+renewal",
-            re.I,
-        )
-    ).first
-
-    try:
-        title.wait_for(
-            state="visible",
-            timeout=8000,
-        )
-    except Exception:
-        log("❌ 点击 Renew 后未出现续期确认弹窗")
-        return False
-
-    confirm_buttons = [
-        page.get_by_role(
-            "dialog"
-        ).last.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew\s+now$",
-                re.I,
-            ),
-        ),
-        page.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Renew\s+now$",
-                re.I,
-            ),
-        ),
-        page.locator(
-            'button:has-text("Renew now")'
-        ),
-    ]
-
-    for group in confirm_buttons:
-        try:
-            count = group.count()
-
-            for i in range(count):
-                button = group.nth(i)
-
-                if (
-                    button.is_visible()
-                    and button.is_enabled()
-                ):
-                    log(
-                        "✅ 确认弹窗已打开，"
-                        "点击 Renew now..."
-                    )
-                    button.click()
-                    return True
-
-        except Exception:
-            pass
-
-    log("❌ 确认弹窗中未找到可点击的 Renew now")
+    deadline = time.monotonic() + timeout / 1000
+    opened_target = False
+    while time.monotonic() < deadline:
+        if server_page_ready(page):
+            return True
+        current = urlsplit(page.url)
+        if current.hostname != "panel.host-ship.com" or security_challenge(page):
+            return False
+        # Wait for the login redirect before opening the server, so a pending
+        # login request is not interrupted by a fixed-delay navigation.
+        if not opened_target and current.path != login_path and not all(login_fields(page)):
+            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+            opened_target = True
+        page.wait_for_timeout(250)
     return False
 
 
-def renewal_succeeded(before, after, body_text):
-    text = body_text.lower()
-    success_words = [
-        "renewed successfully",
-        "renewal successful",
-        "successfully renewed",
-        "renew limit reached",
-    ]
+def confirm_renewal(page, timeout=8000):
+    title = (
+        page.get_by_text(re.compile(r"\bConfirm\s+server\s+renewal\b", re.I))
+        .filter(visible=True)
+        .first
+    )
+    try:
+        title.wait_for(state="visible", timeout=timeout)
+    except Exception:
+        return False
 
-    if any(word in text for word in success_words):
+    button = first_action(
+        (page.get_by_role("dialog").filter(has=title).get_by_role("button", name=CONFIRM_NAME),)
+    )
+    if button is None:
+        # Some panels use an ordinary div instead of role=dialog. Search only
+        # ancestors of the visible confirmation title, never the whole page.
+        scope = title.locator("xpath=..")
+        for _ in range(6):
+            if not scope.count() or scope.evaluate("el => el.tagName") in ("BODY", "HTML"):
+                break
+            button = first_action((scope.get_by_role("button", name=CONFIRM_NAME),))
+            if button is not None:
+                break
+            scope = scope.locator("xpath=..")
+    if button is None:
+        return False
+    log("🔄 正在确认续期")
+    # Never retry another candidate after click(): a timeout can occur after
+    # the server has already accepted the request.
+    button.click()
+    return True
+
+
+def renewal_succeeded(before, after, body_text, before_body=""):
+    before_days, after_days = get_days(before), get_days(after)
+    if before_days is not None and after_days is not None and after_days > before_days:
         return True
 
-    before_days = get_days(before)
-    after_days = get_days(after)
+    def notices(body):
+        lines = body.splitlines()
+        found = set()
+        for index, line in enumerate(lines):
+            context = " ".join(lines[max(0, index - 1) : index + 1])
+            if SUCCESS_NOTICE.fullmatch(line.strip()) and not re.search(
+                r"\b(?:not|failed|failure|unable|error|cannot)\b", context, re.I
+            ):
+                found.add(line.strip().lower())
+        return found
 
-    return (
-        before_days is not None
-        and after_days is not None
-        and after_days > before_days
-    )
+    old_notices = notices(before_body)
+    new_notices = notices(body_text)
+    return bool(new_notices - old_notices)
 
 
-def wait_for_renewal_result(page, before):
-    """Poll once, then reload to avoid reading a stale SPA state."""
-    after = get_renewal_text(page)
-
-    for attempt in range(5):
-        body_text = page.locator(
-            "body"
-        ).inner_text()
-        after = get_renewal_text(page)
-
-        if renewal_succeeded(
-            before,
-            after,
-            body_text,
-        ):
+def wait_for_renewal_result(page, before, before_body, timeout=20000):
+    deadline = time.monotonic() + timeout / 1000
+    reload_at = time.monotonic() + 5
+    reloaded = False
+    after = before
+    while time.monotonic() < deadline:
+        if not is_server_url(page.url):
+            return False, "服务器会话已失效"
+        body = page.locator("body").inner_text()
+        after = renewal_text(body)
+        if renewal_succeeded(before, after, body, before_body):
             return True, after
-
-        page.wait_for_timeout(2000)
-
-        if attempt == 1:
-            page.reload(
-                wait_until="domcontentloaded",
-                timeout=60000,
-            )
-            page.wait_for_timeout(2000)
-
+        if not reloaded and time.monotonic() >= reload_at:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+            reloaded = True
+        page.wait_for_timeout(500)
     return False, after
 
 
-def main():
-    if not SERVER_URL.startswith(
-        "https://panel.host-ship.com/server/"
-    ):
-        log("❌ SERVER_URL 不正确")
+def private_page_details(page):
+    try:
+        return redact(page.locator("body").inner_text(timeout=3000))[:1200]
+    except Exception:
+        return "无法读取页面详情，请查看截图。"
 
-        tg(
-            "❌ Host-Ship 配置错误\n"
-            "SERVER_URL 不是服务器详情页地址"
-        )
 
-        return 1
+def check_and_renew(page):
+    if not login_if_needed(page):
+        return CheckResult("failed", reason="无法进入服务器页面。\n" + private_page_details(page))
+    log("✅ 登录成功")
+    body = page.locator("body").inner_text()
+    before = renewal_text(body)
+    if LIMIT_REACHED.search(body):
+        return CheckResult("not_due", before=before)
+    button = find_renew_button(page)
+    if button is None:
+        if find_renew_button(page, enabled=False) is not None:
+            return CheckResult("not_due", before=before)
+        return CheckResult("failed", before=before, reason="未找到明确的续期按钮。")
 
-    log("======================================")
-    log(" Host-Ship Free Auto Renew")
-    log("======================================")
-
-    log(
-        f"🌐 节点状态：{node_status()}"
+    # The panel's enabled button determines eligibility. A positive countdown
+    # does not mean renewal is forbidden: 4 -> 14 days is a valid renewal.
+    log("🔄 已到续期窗口，正在打开确认弹窗")
+    button.click()
+    try:
+        if not confirm_renewal(page):
+            return CheckResult("failed", before=before, reason="未找到续期确认弹窗中的有效按钮。")
+        success, after = wait_for_renewal_result(page, before, body)
+    except Exception as error:
+        return CheckResult("uncertain", before=before, reason=redact(error))
+    if success:
+        return CheckResult("renewed", before=before, after=after)
+    return CheckResult(
+        "uncertain", before=before, after=after, reason="已提交确认，但尚未观测到明确的续期结果。"
     )
 
-    ip = current_ip()
 
-    log(
-        f"📍 当前出口IP：{ip}"
+def request_proxies():
+    return {"http": PROXY_SERVER, "https": PROXY_SERVER} if IS_PROXY else None
+
+
+def current_ip():
+    try:
+        response = requests.get("https://api.ipify.org", timeout=15, proxies=request_proxies())
+        if response.ok:
+            return str(ip_address(response.text.strip()))
+    except (requests.RequestException, ValueError):
+        pass
+    return "获取失败"
+
+
+def build_message(result, ip):
+    titles = {
+        "renewed": "🎉 Host-Ship 续期成功",
+        "not_due": "⏳ Host-Ship 检查完成",
+        "uncertain": "⚠️ Host-Ship 续期结果待确认",
+        "failed": "❌ Host-Ship 检查或续期失败",
+    }
+    lines = [
+        titles[result.kind],
+        "",
+        f"🖥️ 服务器：#{server_id()}",
+        f"🌐 节点：{'已启用' if IS_PROXY else '直连'}",
+        f"📍 出口 IP：{ip}",
+        f"🕗 检查时间：{datetime.now(BJ_TZ):%Y/%m/%d %H:%M:%S}",
+    ]
+    if result.kind == "not_due":
+        lines.extend(("", "🔒 面板当前不允许续期，本次未提交。", f"📅 面板倒计时：{result.before}"))
+    elif result.kind in ("renewed", "uncertain"):
+        lines.extend(("", f"📅 续期前：{result.before}", f"📅 续期后：{result.after}"))
+    if result.reason:
+        lines.extend(("", "⚠️ 详情：" + redact(result.reason)))
+    lines.extend(("", "⏰ 自动检查：" + SCHEDULE_LABEL))
+    number, attempt = os.getenv("GITHUB_RUN_NUMBER"), os.getenv("GITHUB_RUN_ATTEMPT", "1")
+    repository, run_id = os.getenv("GITHUB_REPOSITORY"), os.getenv("GITHUB_RUN_ID")
+    if number:
+        lines.append(f"🔎 运行 #{number} · 第 {attempt} 次尝试")
+    if repository and run_id:
+        lines.append(f"https://github.com/{repository}/actions/runs/{run_id}")
+    return "\n".join(lines)
+
+
+def telegram_text(text, limit):
+    encoded = text.encode("utf-16-le")
+    return (
+        text
+        if len(encoded) <= limit * 2
+        else encoded[: (limit - 1) * 2].decode("utf-16-le", errors="ignore") + "…"
     )
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            proxy={
-                "server": PROXY_SERVER
-            }
-            if IS_PROXY
-            else None,
-            args=[
-                "--no-sandbox"
-            ],
+
+def telegram_post(method, **kwargs):
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/{method}",
+            timeout=25,
+            proxies=request_proxies(),
+            **kwargs,
         )
-
-        context = browser.new_context(
-            viewport={
-                "width": 1440,
-                "height": 1000,
-            },
-            user_agent=(
-                "Mozilla/5.0 "
-                "(Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/128.0.0.0 Safari/537.36"
-            ),
-        )
-
-        page = context.new_page()
-
         try:
-            if not login_if_needed(page):
-                page.screenshot(
-                    path="hostship_login_fail.png",
-                    full_page=True,
-                )
+            result = response.json()
+        except ValueError:
+            result = {}
+        if response.status_code == 200 and isinstance(result, dict) and result.get("ok") is True:
+            return True
+        log(f"⚠️ Telegram {method} 失败（HTTP {response.status_code}）")
+    except requests.RequestException:
+        log("⚠️ Telegram 请求异常")
+    return False
 
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 登录失败",
-                        "登录失败或遇到安全验证",
-                        ip,
-                    )
-                )
 
-                return 1
+def capture_screenshot(page):
+    try:
+        return page.screenshot(
+            full_page=True, type="png", timeout=10000, mask=[page.locator("input, textarea")]
+        )
+    except Exception:
+        log("⚠️ 页面截图失败")
+        return None
 
-            log("✅ 登录成功")
 
-            before = get_renewal_text(page)
+def notify_result(result, page=None):
+    if not SEND_TG or (result.kind == "not_due" and not MANUAL_RUN):
+        log("ℹ️ 本次不发送 Telegram 通知")
+        return None
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("ℹ️ Telegram 未配置，跳过通知")
+        return None
+    text = build_message(result, current_ip())
+    photo = capture_screenshot(page) if page is not None else None
+    if photo and telegram_post(
+        "sendPhoto",
+        data={"chat_id": TG_CHAT_ID, "caption": telegram_text(text, 1024)},
+        files={"photo": ("hostship-status.png", photo, "image/png")},
+    ):
+        log("📸 Telegram 截图通知发送成功")
+        return True
+    if page is not None:
+        log("ℹ️ 截图未发送成功，改发文字通知")
+    sent = telegram_post(
+        "sendMessage", json={"chat_id": TG_CHAT_ID, "text": telegram_text(text, 4096)}
+    )
+    log("📩 Telegram 文字通知发送成功" if sent else "❌ Telegram 通知发送失败")
+    return sent
 
-            log(
-                f"📅 当前续期状态：{before}"
-            )
 
-            body = page.locator(
-                "body"
-            ).inner_text()
-
-            if re.search(
-                r"Renew\s+Limit\s+Reached",
-                body,
-                re.I,
-            ):
-                log(
-                    "⏳ 目前未到续期时间，"
-                    "不进行操作"
-                )
-
-                if MANUAL_RUN:
-                    tg(
-                        build_check_message(
-                            before,
-                            ip,
-                        )
-                    )
-
-                return 0
-
-            button = find_renew_button(page)
-
-            if not button:
-                page.screenshot(
-                    path="hostship_no_renew_button.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "⚠️ Host-Ship 需要检查",
-                        (
-                            "没有找到可用的 "
-                            f"Renew 按钮；{before}"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
-
-            try:
-                disabled = button.is_disabled()
-
-            except Exception:
-                disabled = False
-
-            if disabled:
-                log(
-                    "⏳ Renew 按钮当前不可点击"
-                )
-
-                if MANUAL_RUN:
-                    tg(
-                        build_check_message(
-                            before,
-                            ip,
-                        )
-                    )
-
-                return 0
-
-            log(
-                "🔄 已到续期窗口，"
-                "点击 Renew..."
-            )
-
-            button.click()
-
-            if not confirm_renewal(page):
-                page.screenshot(
-                    path="hostship_confirm_fail.png",
-                    full_page=True,
-                )
-
-                tg(
-                    build_error_message(
-                        "❌ Host-Ship 续期确认失败",
-                        (
-                            "点击第一层 Renew 后，"
-                            "未能点击确认弹窗中的 Renew now"
-                        ),
-                        ip,
-                    )
-                )
-
-                return 1
-
-            success, after = wait_for_renewal_result(
-                page,
-                before,
-            )
-
-            if success:
-                log(
-                    "✅ 续期成功："
-                    f"{before} -> {after}"
-                )
-
-                tg(
-                    build_success_message(
-                        before,
-                        after,
-                        ip,
-                    )
-                )
-
-                return 0
-
-            page.screenshot(
-                path="hostship_renew_uncertain.png",
-                full_page=True,
-            )
-
-            log(
-                "⚠️ 已点击续期，"
-                "但无法确认结果"
-            )
-
-            tg(
-                build_error_message(
-                    "⚠️ Host-Ship 续期结果需要检查",
-                    (
-                        f"续期前：{before}；"
-                        f"续期后：{after}"
-                    ),
-                    ip,
-                )
-            )
-
-            return 1
-
-        except Exception as exc:
-            log(
-                f"❌ 运行异常：{exc}"
-            )
-
-            try:
-                page.screenshot(
-                    path="hostship_error.png",
-                    full_page=True,
-                )
-            except Exception:
-                pass
-
-            tg(
-                build_error_message(
-                    "❌ Host-Ship 自动续期异常",
-                    str(exc),
-                    ip,
-                )
-            )
-
-            return 1
-
-        finally:
-            browser.close()
+def main():
+    log("Host-Ship 自动检查续期")
+    runtime = browser = page = None
+    result = CheckResult("failed", reason="初始化未完成。")
+    notification = None
+    try:
+        if not valid_server_url(SERVER_URL):
+            raise ValueError("SERVER_URL 不是有效的 Host-Ship 服务器详情页地址。")
+        if not HOSTSHIP_LOGIN or not HOSTSHIP_PASSWORD:
+            raise ValueError("未配置 Host-Ship 登录账号或密码。")
+        runtime = sync_playwright().start()
+        browser = runtime.chromium.launch(
+            headless=True,
+            proxy={"server": PROXY_SERVER} if IS_PROXY else None,
+            args=["--no-sandbox"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1000},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        )
+        page = context.new_page()
+        result = check_and_renew(page)
+    except Exception as error:
+        result = CheckResult("failed", reason=redact(error))
+    finally:
+        log(
+            {
+                "renewed": "✅ 续期成功",
+                "not_due": "⏳ 当前不可续期，本次未提交",
+                "uncertain": "⚠️ 已提交续期，结果待确认",
+                "failed": "❌ 检查或续期失败",
+            }[result.kind]
+        )
+        # One notification decision for every path, while the browser is open.
+        try:
+            notification = notify_result(result, page)
+        except Exception:
+            log("❌ Telegram 通知发送失败")
+            notification = False
+        for resource, method in ((browser, "close"), (runtime, "stop")):
+            if resource is not None:
+                try:
+                    getattr(resource, method)()
+                except Exception:
+                    log("⚠️ 浏览器资源清理未完成")
+    return 1 if notification is False else result.exit_code
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

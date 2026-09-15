@@ -1,121 +1,67 @@
 # Host-Ship Auto Renew
 
-一个可直接 Fork / 上传到 GitHub 使用的 Host-Ship 自动续期模板。
+通过 GitHub Actions 检查 Host-Ship 免费服务器，在面板允许续期时提交确认，并发送 Telegram 图文通知。
 
-## 功能
+## 续期与通知
 
-- 每天北京时间 08:00 自动检查一次
-- 仅在 Host-Ship 页面出现可用的 `Renew` 按钮时尝试续期
-- 未到续期窗口时不会点击续期
-- 手动运行时会发送 Telegram 检查结果
-- 真正续期成功、失败或异常时发送 Telegram
-- Telegram 中显示：
-  - 服务器编号
-  - 节点状态
-  - 当前出口 IP
-  - 检查时间
-  - 距离续期天数
-  - 预计可续期日期
-  - 自动检查时间
-- 支持可选 `NODE_LINK`
-- 已测试可用于 VMess / VLESS 类分享链接
-- 不尝试绕过验证码、Cloudflare 或其他安全验证
+- 以服务器页面中**可用的 `Renew` 按钮**判断续期窗口，确认弹窗中的 `Renew now` 只提交一次。
+- 面板倒计时不是“距离可续期还有多久”。例如倒计时还有 4 天时，也可能允许续期至 14 天。
+- 只有倒计时增加，或本次操作出现新的明确成功提示，才报告续期成功。旧提示、`Renew Limit Reached` 和无法确认的结果不会被当作成功。
+- 手动运行会发送检查结果；定时运行在当前不可续期时保持安静，实际续期、失败或结果不确定时发送通知。
+- 正常每次执行发送一条“截图 + 文字说明”的 TG 消息。截图或图片上传失败时改发文字；网络超时后的备用发送可能造成重复投递。
+- 通知包含服务器编号、节点状态、出口 IP、检查时间、面板倒计时、运行编号、尝试次数和运行链接，便于区分手动重跑。
+- 同一仓库的续期任务串行运行，避免同时操作同一服务器。
+- 不自动处理需要人工完成的验证码或安全验证。
 
 ## GitHub Secrets
 
-进入：
+在 **Settings → Secrets and variables → Actions** 配置：
 
-`Settings -> Secrets and variables -> Actions`
+| 名称 | 用途 |
+| --- | --- |
+| `SERVER_URL` | 服务器详情页，如 `https://panel.host-ship.com/server/xxxxxxxx` |
+| `HOSTSHIP_LOGIN` | 登录账号或邮箱 |
+| `HOSTSHIP_PASSWORD` | 登录密码，保留原始首尾空格 |
+| `TG_BOT_TOKEN` | Telegram Bot Token |
+| `TG_CHAT_ID` | 接收通知的聊天 ID |
+| `NODE_LINK` | 可选的代理分享链接；留空时直连 |
 
-添加以下 Repository secrets：
+不配置 TG 时仍可执行检查和续期。不要把真实账号、节点、服务器地址或 Token 提交进仓库。
 
-### 必填
+## 运行计划
 
-`SERVER_URL`
+当前沿用工作流中的 `20 21 */3 * *`：按 UTC 每月 1、4、7……日的 21:20 触发，对应次日北京时间 **05:20**。大致每三天检查一次，跨月间隔会受月份长度影响。
 
-Host-Ship 服务器详情页完整地址，例如：
+修改计划时，同时更新 [.github/workflows/renew.yml](.github/workflows/renew.yml) 中的 `schedule` 和通知用的 `SCHEDULE_LABEL`。GitHub Actions 的实际启动时间可能延迟。
 
-`https://panel.host-ship.com/server/xxxxxxxx`
+手动运行：**Actions → Host-Ship Auto Renew → Run workflow**。调试时可以关闭“发送 Telegram 图文通知”。重跑同一运行的任务属于另一次执行，会重新发送通知。
 
-`HOSTSHIP_LOGIN`
+## 公开日志隐私
 
-Host-Ship 登录账号/邮箱。
+- 公开日志仅输出预先定义的执行状态，以及不含响应正文的 HTTP 状态码。
+- 浏览器、代理脚本和其他依赖的原始输出不会直接进入公开日志。代理初始化只能向后续步骤传递启用标志和不含凭据的本地代理地址。
+- 页面正文、服务器标识、出口 IP、完整 URL 和异常详情不会打印到 Actions 日志中。
+- 截图在内存中生成，遮住输入框后只发送到 `TG_CHAT_ID` 指定的聊天；不上传 Actions 截图附件。
+- TG 接收方仍能看到通知和页面截图中的服务器信息，请按需要设置接收聊天。
+- 这些保护只作用于新运行。以前的公开日志或附件需要在 Actions 中自行清理。
 
-`HOSTSHIP_PASSWORD`
+## 代理
 
-Host-Ship 登录密码。
-
-`TG_BOT_TOKEN`
-
-Telegram Bot Token。
-
-`TG_CHAT_ID`
-
-接收通知的 Telegram Chat ID。
-
-### 可选
-
-`NODE_LINK`
-
-代理节点完整分享链接，例如：
-
-`vmess://...`
-
-或：
-
-`vless://...`
-
-> 不要把节点链接、密码、Telegram Token 写进代码或 README。
-
-## 第一次测试
-
-进入：
-
-`Actions -> Host-Ship Auto Renew -> Run workflow`
-
-手动运行时，即使当前未到续期窗口，也会发送一条 Telegram 检查消息。
-
-## 自动运行
-
-默认每天北京时间：
-
-`08:00`
-
-自动检查一次。
-
-如果当前页面仍显示类似：
-
-`Renew Limit Reached`
-
-脚本不会点击续期。
-
-如果出现可用的 `Renew` 按钮，脚本会尝试续期。
-
-## 隐私说明
-
-这个模板本身不包含任何账号、密码、节点、TG Token、服务器真实地址或真实 IP。
-
-所有敏感信息都应该只存放在 GitHub Repository secrets 中。
-
-如果你公开分享这个模板：
-
-- 不要把自己的 Secrets 写进代码
-- 不要公开失败截图或 Actions artifacts 中可能包含的敏感页面
-- 不要把真实 `NODE_LINK` 放进 README
-- 不要把真实服务器 URL 写入仓库
-
-## 节点兼容说明
-
-当前代理初始化使用第三方脚本：
+配置 `NODE_LINK` 后，工作流使用第三方初始化脚本：
 
 `https://main.ssss.nyc.mn/setup_proxy.sh`
 
-VMess / VLESS 已验证可用。
+初始化失败会有限重试，仍失败则停止任务。日志过滤不会改变第三方脚本本身的运行权限。VMess/VLESS 是原模板已验证的类型，其他协议取决于转换脚本的支持情况。
 
-部分 Trojan 分享链接如果包含某些 `type=tcp` 参数，可能会被该第三方转换脚本生成成 sing-box 不兼容配置；这种情况建议换用 VMess/VLESS，或自行修改代理初始化方式。
+## 本地验证
 
-## 说明
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m playwright install chromium
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/python -m unittest discover -s tests -v
+```
 
-GitHub Actions 定时任务可能会有几分钟延迟，这是正常现象。
-
-Host-Ship 页面结构如果后续发生变化，脚本可能需要更新选择器。
+测试使用模拟接口和浏览器页面，不需要真实 Secrets。它们覆盖登录跳转、确认按钮范围、重复提交、续期成功判定、截图备用通知和公开日志隔离。
