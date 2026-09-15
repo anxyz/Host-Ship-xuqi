@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 PUBLIC_STATUSES = frozenset(
     {
         "Host-Ship 自动检查续期",
+        "⚠️ 面板连接暂时失败，正在重试",
+        "❌ 面板连接失败",
         "⚠️ 登录页面需要人工检查",
         "🔐 正在登录 Host-Ship",
         "🔄 正在确认续期",

@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 SERVER_URL = os.getenv("SERVER_URL", "").strip()
@@ -47,6 +49,24 @@ SUCCESS_NOTICE = re.compile(
     r"(?:renewed successfully|renewal successful|successfully renewed)[.!]?$",
     re.I,
 )
+
+
+NETWORK_ERRORS = (
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_TIMED_OUT",
+    "ERR_TIMED_OUT",
+    "ERR_NAME_NOT_RESOLVED",
+    "ERR_NETWORK_CHANGED",
+)
+RETRYABLE_HTTP = {500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+class PanelNavigationError(RuntimeError):
+    """A read-only panel navigation failed after bounded retries."""
 
 
 @dataclass(frozen=True)
@@ -200,8 +220,31 @@ def security_challenge(page):
     )
 
 
+def navigate(page, url=None, attempts=3):
+    """Retry only GET/reload operations, never login or renewal submissions."""
+    for attempt in range(1, attempts + 1):
+        try:
+            if url is None:
+                response = page.reload(wait_until="domcontentloaded", timeout=60000)
+            else:
+                response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            if response is None or response.status not in RETRYABLE_HTTP:
+                return response
+            error = PanelNavigationError(f"面板暂时不可用（HTTP {response.status}）。")
+        except PlaywrightError as cause:
+            if not isinstance(cause, PlaywrightTimeoutError) and not any(
+                code in str(cause) for code in NETWORK_ERRORS
+            ):
+                raise
+            error = PanelNavigationError(str(cause))
+        if attempt == attempts:
+            raise error
+        log("⚠️ 面板连接暂时失败，正在重试")
+        page.wait_for_timeout(attempt * 1000)
+
+
 def login_if_needed(page, timeout=20000):
-    page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+    navigate(page, SERVER_URL)
     deadline = time.monotonic() + timeout / 1000
     while time.monotonic() < deadline:
         if server_page_ready(page):
@@ -246,8 +289,9 @@ def login_if_needed(page, timeout=20000):
         # Wait for the login redirect before opening the server, so a pending
         # login request is not interrupted by a fixed-delay navigation.
         if not opened_target and current.path != login_path and not all(login_fields(page)):
-            page.goto(SERVER_URL, wait_until="domcontentloaded", timeout=60000)
+            navigate(page, SERVER_URL)
             opened_target = True
+            deadline = time.monotonic() + timeout / 1000
         page.wait_for_timeout(250)
     return False
 
@@ -312,15 +356,17 @@ def wait_for_renewal_result(page, before, before_body, timeout=20000):
     reload_at = time.monotonic() + 5
     reloaded = False
     after = before
-    while time.monotonic() < deadline:
+    while True:
         if not is_server_url(page.url):
             return False, "服务器会话已失效"
         body = page.locator("body").inner_text()
         after = renewal_text(body)
         if renewal_succeeded(before, after, body, before_body):
             return True, after
+        if time.monotonic() >= deadline:
+            break
         if not reloaded and time.monotonic() >= reload_at:
-            page.reload(wait_until="domcontentloaded", timeout=60000)
+            navigate(page)
             reloaded = True
         page.wait_for_timeout(500)
     return False, after
@@ -496,6 +542,8 @@ def main():
         page = context.new_page()
         result = check_and_renew(page)
     except Exception as error:
+        if isinstance(error, PanelNavigationError):
+            log("❌ 面板连接失败")
         result = CheckResult("failed", reason=redact(error))
     finally:
         log(

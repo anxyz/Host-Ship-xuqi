@@ -66,7 +66,7 @@ class BrowserTests(unittest.TestCase):
         )
         self.page.goto(SERVER)
 
-    def login_routes(self, accept=True):
+    def login_routes(self, accept=True, client_redirect=False):
         state = {"logged_in": False, "credentials": None}
 
         def handle(route):
@@ -77,6 +77,15 @@ class BrowserTests(unittest.TestCase):
             elif route.request.url == SERVER:
                 if state["logged_in"]:
                     route.fulfill(content_type="text/html", body=PANEL)
+                elif client_redirect:
+                    route.fulfill(
+                        content_type="text/html",
+                        body=(
+                            "<script>setTimeout(() => location.href="
+                            + json.dumps(LOGIN)
+                            + ", 10)</script><body>Loading</body>"
+                        ),
+                    )
                 else:
                     route.fulfill(
                         content_type="text/html",
@@ -103,6 +112,10 @@ class BrowserTests(unittest.TestCase):
         self.login_routes(accept=False)
         self.assertFalse(app.login_if_needed(self.page, timeout=400))
         self.assertEqual(self.page.url, LOGIN)
+
+    def test_waits_for_client_side_login_redirect(self):
+        self.login_routes(client_redirect=True)
+        self.assertTrue(app.login_if_needed(self.page, timeout=2000))
 
     def test_server_description_containing_password_does_not_trigger_login(self):
         self.panel()

@@ -67,6 +67,70 @@ class StateTests(unittest.TestCase):
         )
 
 
+class NavigationTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(app, "log"))
+        self.page = MagicMock()
+
+    def test_temporary_socks_failure_retries_the_same_target(self):
+        success = MagicMock(status=200)
+        self.page.goto.side_effect = [
+            app.PlaywrightError("Page.goto: net::ERR_SOCKS_CONNECTION_FAILED"),
+            success,
+        ]
+        self.assertIs(app.navigate(self.page, SERVER), success)
+        self.assertEqual(self.page.goto.call_count, 2)
+        self.assertTrue(all(call.args == (SERVER,) for call in self.page.goto.call_args_list))
+        self.page.wait_for_timeout.assert_called_once_with(1000)
+
+    def test_origin_error_is_retried(self):
+        self.page.goto.side_effect = [MagicMock(status=522), MagicMock(status=200)]
+        self.assertEqual(app.navigate(self.page, SERVER).status, 200)
+        self.assertEqual(self.page.goto.call_count, 2)
+
+    def test_retries_are_bounded(self):
+        self.page.goto.side_effect = app.PlaywrightError("net::ERR_SOCKS_CONNECTION_FAILED")
+        with self.assertRaises(app.PanelNavigationError):
+            app.navigate(self.page, SERVER)
+        self.assertEqual(self.page.goto.call_count, 3)
+
+    def test_other_browser_errors_are_not_retried(self):
+        self.page.goto.side_effect = app.PlaywrightError("Unrelated browser error")
+        with self.assertRaises(app.PlaywrightError):
+            app.navigate(self.page, SERVER)
+        self.page.goto.assert_called_once()
+
+    def test_security_rejection_is_not_retried(self):
+        self.page.goto.return_value = MagicMock(status=403)
+        self.assertEqual(app.navigate(self.page, SERVER).status, 403)
+        self.page.goto.assert_called_once()
+
+    def test_slow_reload_still_checks_the_fresh_renewal_result(self):
+        clock = {"time": 0, "renewed": False}
+        self.page.url = SERVER
+        self.page.locator.return_value.inner_text.side_effect = lambda: (
+            "Renewal in 14 Days" if clock["renewed"] else "Renewal in 4 Days"
+        )
+
+        def reload(**kwargs):
+            clock.update(time=20, renewed=True)
+            return MagicMock(status=200)
+
+        self.page.reload.side_effect = reload
+        self.page.wait_for_timeout.side_effect = lambda milliseconds: clock.update(
+            time=clock["time"] + milliseconds / 1000
+        )
+        with (
+            patch.object(app, "SERVER_URL", SERVER),
+            patch.object(app.time, "monotonic", side_effect=lambda: clock["time"]),
+        ):
+            success, after = app.wait_for_renewal_result(
+                self.page, "Renewal in 4 Days", "Renewal in 4 Days", timeout=8000
+            )
+        self.assertTrue(success)
+        self.assertEqual(after, "Renewal in 14 Days")
+
+
 def response(ok=True, status=200, description=""):
     result = MagicMock(status_code=status)
     result.json.return_value = {"ok": ok, "description": description}
