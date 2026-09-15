@@ -448,58 +448,120 @@ def find_renew_button(page):
     return None
 
 
-def confirm_if_needed(page):
-    page.wait_for_timeout(800)
-
-    dialog = page.locator(
-        '[role="dialog"]'
-    ).last
+def confirm_renewal(page):
+    """Wait for the renewal dialog and click the real submit button."""
+    title = page.get_by_text(
+        re.compile(
+            r"Confirm\s+server\s+renewal",
+            re.I,
+        )
+    ).first
 
     try:
-        if (
-            not dialog.count()
-            or not dialog.is_visible()
-        ):
-            return
-
+        title.wait_for(
+            state="visible",
+            timeout=8000,
+        )
     except Exception:
-        return
+        log("❌ 点击 Renew 后未出现续期确认弹窗")
+        return False
 
-    buttons = [
-        dialog.get_by_role(
+    confirm_buttons = [
+        page.get_by_role(
+            "dialog"
+        ).last.get_by_role(
             "button",
             name=re.compile(
-                r"^Confirm$",
+                r"^Renew\s+now$",
                 re.I,
             ),
         ),
-        dialog.get_by_role(
+        page.get_by_role(
             "button",
             name=re.compile(
-                r"^Renew$",
+                r"^Renew\s+now$",
                 re.I,
             ),
         ),
-        dialog.get_by_role(
-            "button",
-            name=re.compile(
-                r"^Yes$",
-                re.I,
-            ),
+        page.locator(
+            'button:has-text("Renew now")'
         ),
     ]
 
-    for group in buttons:
+    for group in confirm_buttons:
         try:
-            if (
-                group.count()
-                and group.first.is_visible()
-            ):
-                group.first.click()
-                return
+            count = group.count()
+
+            for i in range(count):
+                button = group.nth(i)
+
+                if (
+                    button.is_visible()
+                    and button.is_enabled()
+                ):
+                    log(
+                        "✅ 确认弹窗已打开，"
+                        "点击 Renew now..."
+                    )
+                    button.click()
+                    return True
 
         except Exception:
             pass
+
+    log("❌ 确认弹窗中未找到可点击的 Renew now")
+    return False
+
+
+def renewal_succeeded(before, after, body_text):
+    text = body_text.lower()
+    success_words = [
+        "renewed successfully",
+        "renewal successful",
+        "successfully renewed",
+        "renew limit reached",
+    ]
+
+    if any(word in text for word in success_words):
+        return True
+
+    before_days = get_days(before)
+    after_days = get_days(after)
+
+    return (
+        before_days is not None
+        and after_days is not None
+        and after_days > before_days
+    )
+
+
+def wait_for_renewal_result(page, before):
+    """Poll once, then reload to avoid reading a stale SPA state."""
+    after = get_renewal_text(page)
+
+    for attempt in range(5):
+        body_text = page.locator(
+            "body"
+        ).inner_text()
+        after = get_renewal_text(page)
+
+        if renewal_succeeded(
+            before,
+            after,
+            body_text,
+        ):
+            return True, after
+
+        page.wait_for_timeout(2000)
+
+        if attempt == 1:
+            page.reload(
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
+            page.wait_for_timeout(2000)
+
+    return False, after
 
 
 def main():
@@ -656,34 +718,29 @@ def main():
 
             button.click()
 
-            confirm_if_needed(page)
+            if not confirm_renewal(page):
+                page.screenshot(
+                    path="hostship_confirm_fail.png",
+                    full_page=True,
+                )
 
-            page.wait_for_timeout(4000)
+                tg(
+                    build_error_message(
+                        "❌ Host-Ship 续期确认失败",
+                        (
+                            "点击第一层 Renew 后，"
+                            "未能点击确认弹窗中的 Renew now"
+                        ),
+                        ip,
+                    )
+                )
 
-            after = get_renewal_text(page)
+                return 1
 
-            text_after = page.locator(
-                "body"
-            ).inner_text()
-
-            success_words = [
-                "renewed successfully",
-                "renewal successful",
-                "successfully renewed",
-                "renew limit reached",
-            ]
-
-            success = any(
-                word in text_after.lower()
-                for word in success_words
+            success, after = wait_for_renewal_result(
+                page,
+                before,
             )
-
-            if (
-                before != "未识别"
-                and after != "未识别"
-                and after != before
-            ):
-                success = True
 
             if success:
                 log(
