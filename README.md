@@ -31,7 +31,7 @@
 
 ## 运行计划
 
-当前沿用工作流中的 `20 21 */3 * *`：按 UTC 每月 1、4、7……日的 21:20 触发，对应次日北京时间 **05:20**。大致每三天检查一次，跨月间隔会受月份长度影响。
+当前计划为**每周六北京时间 05:20**，每 7 天检查一次。工作流使用 UTC 周五 21:20，对应 Cron `20 21 * * 5`。
 
 修改计划时，同时更新 [.github/workflows/renew.yml](.github/workflows/renew.yml) 中的 `schedule` 和通知用的 `SCHEDULE_LABEL`。GitHub Actions 的实际启动时间可能延迟。
 
